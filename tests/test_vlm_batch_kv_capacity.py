@@ -193,3 +193,16 @@ def test_empty_extend_preserves_backend_state_and_dtype(backend, empty_first):
             assert mx.array_equal(x, y).item()
         else:
             assert x == y
+
+
+def test_cold_and_restored_backends_can_share_a_batch(backend):
+    stock, patched = backend
+    other = lm_cache if patched is vlm_cache else vlm_cache
+    a, b = make(stock, [271, 269]), make(patched, [271, 269])
+    a.extend(make(pristine(other), [513]))
+    b.extend(make(other, [513]))
+    equal(a, b)
+    x = mx.ones((3, 2, 7, 8), mx.bfloat16)
+    for c in (a, b):
+        c.update_and_fetch(x, x / 4)
+    equal(a, b)
