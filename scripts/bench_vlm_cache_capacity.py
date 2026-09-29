@@ -7,7 +7,8 @@ import json
 import time
 
 import mlx.core as mx
-from mlx_vlm.models.cache import BatchKVCache
+from mlx_lm.models import cache as lm_cache
+from mlx_vlm.models import cache as vlm_cache
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 
 import omlx.scheduler  # noqa: F401 (activate serving cache patches)
@@ -15,7 +16,9 @@ from omlx.utils.proc_memory import get_phys_footprint
 
 p = argparse.ArgumentParser()
 p.add_argument("mode", choices=["append", "remerge", "ragged", "singleton"])
+p.add_argument("--backend", choices=["vlm", "lm"], default="vlm")
 a = p.parse_args()
+BatchKVCache = (vlm_cache if a.backend == "vlm" else lm_cache).BatchKVCache
 mx.set_memory_limit(8 * 1024**3)
 mx.set_cache_limit(4 * 1024**3)
 rows = 1 if a.mode == "singleton" else 2
@@ -90,6 +93,7 @@ print(
     json.dumps(
         dict(
             mode=a.mode,
+            backend=a.backend,
             rows=rows,
             layers=layers,
             tokens=tokens,

@@ -6,13 +6,23 @@ import random
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models import cache as lm_cache
 from mlx_vlm.models import cache as vlm_cache
 
 import omlx.scheduler  # noqa: F401
 
-spec = importlib.util.spec_from_file_location("_stock_vlm_cache", vlm_cache.__file__)
-stock = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(stock)
+
+def pristine(module):
+    spec = importlib.util.spec_from_file_location("_stock_cache", module.__file__)
+    stock = importlib.util.module_from_spec(spec)
+    stock.__package__ = module.__package__
+    spec.loader.exec_module(stock)
+    return stock
+
+
+@pytest.fixture(params=[vlm_cache, lm_cache], ids=["vlm", "lm-restored"])
+def backend(request):
+    return pristine(request.param), request.param
 
 
 def make(module, lengths):
@@ -31,9 +41,11 @@ def equal(a, b):
     for x, y in zip(a.state, b.state):
         if x is None or y is None:
             assert x is y
-        else:
+        elif isinstance(x, mx.array):
             assert x.shape == y.shape
             assert mx.array_equal(x, y).item()
+        else:
+            assert x == y
     assert a._idx == b._idx
     if a.keys is None:
         return
@@ -49,7 +61,13 @@ def equal(a, b):
             >= c.left_padding[:, None, None, None]
         )
         outputs.append(
-            mx.fast.scaled_dot_product_attention(q, *c.state[:2], scale=0.25, mask=mask)
+            mx.fast.scaled_dot_product_attention(
+                q,
+                c.keys[..., : c._idx, :],
+                c.values[..., : c._idx, :],
+                scale=0.25,
+                mask=mask,
+            )
         )
     assert mx.array_equal(*outputs).item()
     for i in range(a.keys.shape[0]):
@@ -58,9 +76,10 @@ def equal(a, b):
 
 
 @pytest.mark.parametrize("seed", range(20))
-def test_cache_and_attention_match_stock_through_lifecycle(seed):
+def test_cache_and_attention_match_stock_through_lifecycle(seed, backend):
+    stock, patched = backend
     rng = random.Random(seed)
-    a, b = make(stock, [271, 269, 134]), make(vlm_cache, [271, 269, 134])
+    a, b = make(stock, [271, 269, 134]), make(patched, [271, 269, 134])
     equal(a, b)
     for step in range(40):
         operation = rng.choice(
@@ -81,7 +100,7 @@ def test_cache_and_attention_match_stock_through_lifecycle(seed):
             assert a.trim(n) == b.trim(n)
         elif operation == "merge":
             a = stock.BatchKVCache.merge([a.extract(i) for i in range(a.keys.shape[0])])
-            b = vlm_cache.BatchKVCache.merge(
+            b = patched.BatchKVCache.merge(
                 [b.extract(i) for i in range(b.keys.shape[0])]
             )
         elif operation == "filter":
@@ -91,20 +110,23 @@ def test_cache_and_attention_match_stock_through_lifecycle(seed):
         elif operation == "extend" and a.keys.shape[0] < 6:
             lengths = [rng.randint(1, 290)]
             a.extend(make(stock, lengths))
-            b.extend(make(vlm_cache, lengths))
+            b.extend(make(patched, lengths))
         elif operation == "restore":
             # The prefix restore contract assigns serialized state to a fresh cache.
             restored = []
-            for module, c in ((stock, a), (vlm_cache, b)):
+            for module, c in ((stock, a), (patched, b)):
                 clone = module.BatchKVCache([0] * c.keys.shape[0])
-                clone.state = tuple(mx.array(x) for x in c.state)
+                clone.state = tuple(
+                    mx.array(x) if isinstance(x, mx.array) else x for x in c.state
+                )
                 restored.append(clone)
             a, b = restored
         equal(a, b)
 
 
-def test_merge_reserves_append_without_changing_logical_width():
-    c = make(vlm_cache, [8192, 8187])
+def test_merge_reserves_append_without_changing_logical_width(backend):
+    _, patched = backend
+    c = make(patched, [8192, 8187])
     assert c._logical_width() == 8192
     capacity = c.keys.shape[2]
     assert 8192 < capacity <= 8192 * 1.125 + 512
@@ -113,16 +135,61 @@ def test_merge_reserves_append_without_changing_logical_width():
         c.update_and_fetch(x, x)
         assert c.keys.shape[2] == capacity
     row = c.extract(0)
-    assert row.keys.shape[2] > row.offset
+    if patched is vlm_cache:
+        assert row.keys.shape[2] > row.offset
+    else:
+        assert row.keys.shape[2] == row.offset
 
 
-def test_empty_state_and_idempotent_install():
+def test_empty_state_and_idempotent_install(backend):
     from omlx.patches.vlm_batch_kv_capacity import apply_batch_kv_capacity_patch
 
-    c = vlm_cache.BatchKVCache([0, 0])
+    _, patched = backend
+    c = patched.BatchKVCache([0, 0])
     c.prepare(right_padding=[1, 0])
     c.finalize()
     assert c.state[:2] == (None, None)
-    method = vlm_cache.BatchKVCache.update_and_fetch
+    method = patched.BatchKVCache.update_and_fetch
     assert apply_batch_kv_capacity_patch()
-    assert vlm_cache.BatchKVCache.update_and_fetch is method
+    assert patched.BatchKVCache.update_and_fetch is method
+
+
+def test_prefix_handler_restore_uses_capacity_managed_cache():
+    from omlx.cache.type_handlers import KVCacheHandler
+
+    handler = KVCacheHandler()
+    source = make(vlm_cache, [513]).extract(0)
+    state = handler.extract_state(source)
+    parts = [handler.slice_state(state, 0, 256), handler.slice_state(state, 256, 513)]
+    restored = handler.reconstruct_cache(handler.concatenate_states(parts))
+    # The actual SSD restore handler chooses mlx-lm, even for a VLM model.
+    assert type(restored) is lm_cache.KVCache
+    batch = restored.merge([restored])
+    assert type(batch) is lm_cache.BatchKVCache
+    assert batch.keys.shape[2] > batch._logical_width() == 513
+    stock = pristine(lm_cache)
+    expected = stock.KVCache()
+    expected.state = (*source.state, source.offset)
+    expected = stock.BatchKVCache.merge([expected])
+    equal(expected, batch)
+    x = mx.ones((1, 2, 17, 8), mx.bfloat16)
+    for c in (expected, batch):
+        c.update_and_fetch(x, x / 4)
+    equal(expected, batch)
+
+
+@pytest.mark.parametrize("empty_first", [False, True])
+def test_empty_extend_preserves_backend_state_and_dtype(backend, empty_first):
+    results = []
+    for module in backend:
+        empty = module.BatchKVCache([0])
+        full = make(module, [17])
+        a, b = (empty, full) if empty_first else (full, empty)
+        a.extend(b)
+        results.append(a.state)
+    for x, y in zip(*results):
+        if isinstance(x, mx.array):
+            assert x.dtype == y.dtype
+            assert mx.array_equal(x, y).item()
+        else:
+            assert x == y

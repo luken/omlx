@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reuse capacity in the generic mlx-vlm BatchKVCache, preserving logical KV.
+"""Reuse capacity in generic mlx-vlm and restored mlx-lm batched KV caches.
 
 Capacity/roll/join logic adapted from yoyo930021's oMLX PR #4030 (Apache-2.0),
 which targets the vendored Qwen4 cache. This installs on the existing generic
-class, so already-imported class references and exact-type checks stay valid.
+classes, so already-imported class references and exact-type checks stay valid.
+Prefix-cache restore reconstructs mlx-lm KVCache even for a VLM model; both
+backends need capacity reuse, with their distinct serialized states preserved.
 """
 
 import mlx.core as mx
+from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
+from mlx_lm.models.cache import KVCache as LMKVCache
 from mlx_vlm.models.cache import BatchKVCache, KVCache, dynamic_roll
 
 
@@ -182,7 +186,7 @@ class _CapacityMethods:
         )
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
-        if self._right_padding is not None:
+        if self._right_padding is not None and not isinstance(self, LMBatchKVCache):
             self._right_padding = self._right_padding[batch_indices]
 
         # Shift left to reduce padding
@@ -239,6 +243,11 @@ class _CapacityMethods:
             batch_size, heads, length_b, head_dim = logical[id(other)][0].shape
             value_dim = other.values.shape[3]
         max_size = max(length_a, length_b)
+        empty_dtype = (
+            (self.keys if self.keys is not None else other.keys).dtype
+            if isinstance(self, LMBatchKVCache)
+            else mx.float32
+        )
 
         if self._extend_into_capacity(other, logical, max_idx, max_size):
             return
@@ -249,8 +258,8 @@ class _CapacityMethods:
             k, v = logical[id(c)]
             if k is None:
                 rows = c.offset.shape[0]
-                k = mx.array([]).reshape(rows, heads, 0, head_dim)
-                v = mx.array([]).reshape(rows, heads, 0, value_dim)
+                k = mx.zeros((rows, heads, 0, head_dim), dtype=empty_dtype)
+                v = mx.zeros((rows, heads, 0, value_dim), dtype=empty_dtype)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -323,7 +332,7 @@ class _CapacityMethods:
 
         # No cache has content so make an empty one
         if max_length == 0:
-            return BatchKVCache([0] * len(caches))
+            return cls([0] * len(caches))
 
         padding = [max_length - length for length in lengths]
         batch_size = len(caches)
@@ -358,8 +367,14 @@ class _CapacityMethods:
     def extract(self, idx):
         padding = int(self.left_padding[idx].item())
         length = self._idx - padding
-        capacity = _ladder_capacity(length + self.step, self.step)
-        cache = KVCache()
+        # mlx-lm KVCache.state exposes the full bank (unlike mlx-vlm's sliced
+        # state), so reserving a row there would change its serialized state.
+        capacity = (
+            length
+            if isinstance(self, LMBatchKVCache)
+            else _ladder_capacity(length + self.step, self.step)
+        )
+        cache = LMKVCache() if isinstance(self, LMBatchKVCache) else KVCache()
         cache.keys = mx.zeros(
             (1, self.keys.shape[1], capacity, self.keys.shape[3]), self.keys.dtype
         )
@@ -376,12 +391,26 @@ class _CapacityMethods:
         return cache
 
 
+def _lm_state(cache):
+    # mlx-lm serializes the entire logical bank and a separate write index;
+    # mlx-vlm instead serializes a four-tuple sliced to that index.
+    keys, values = _logical_kv(cache)
+    return keys, values, cache.offset, cache.left_padding, cache._idx
+
+
+def _set_lm_state(cache, state):
+    cache.keys, cache.values, cache.offset, cache.left_padding, cache._idx = state
+
+
 def apply_batch_kv_capacity_patch() -> bool:
     """Patch in place before cache creation; repeated installation is a no-op."""
-    if getattr(BatchKVCache, "_omlx_capacity_managed", False):
-        return True
-    for name, member in vars(_CapacityMethods).items():
-        if not name.startswith("__"):
-            setattr(BatchKVCache, name, member)
-    BatchKVCache._omlx_capacity_managed = True
+    for cls in (BatchKVCache, LMBatchKVCache):
+        if getattr(cls, "_omlx_capacity_managed", False):
+            continue
+        for name, member in vars(_CapacityMethods).items():
+            if not name.startswith("__"):
+                setattr(cls, name, member)
+        if cls is LMBatchKVCache:
+            cls.state = property(_lm_state, _set_lm_state)
+        cls._omlx_capacity_managed = True
     return True
